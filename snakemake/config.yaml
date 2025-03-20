@@ -1,0 +1,17 @@
+# Configuration for SARS-CoV-2 variant analysis Snakemake workflow
+
+# Directories
+data_dir: "../data" 
+output_dir: "../results"
+qc_dir: "../results/qc_results"
+trimmed_dir: "../results/trimmed_data"
+
+# Files
+adapters_file: "../data/adapters.fa"
+ref_genome: "../data/SARS-CoV-2-reference.fasta"
+
+# Sample information
+run_id: "ERR11584473"
+
+# Filter parameters
+qd_filter_threshold: 2.0

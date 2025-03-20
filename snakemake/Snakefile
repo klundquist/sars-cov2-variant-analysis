@@ -1,0 +1,238 @@
+# Snakefile for SARS-CoV-2 variant analysis
+
+# Import configuration
+configfile: "config.yaml"
+
+# Define directories and files
+DATA_DIR = config["data_dir"]
+OUTPUT_DIR = config["output_dir"]
+QC_DIR = config["qc_dir"]
+TRIMMED_DIR = config["trimmed_dir"]
+ADAPTERS_FILE = config["adapters_file"]
+RUN_ID = config["run_id"]
+REF_GENOME = config["ref_genome"]
+QD_THRESHOLD = config["qd_filter_threshold"]
+
+# Define the final output files we want to generate
+rule all:
+    input:
+        os.path.join(OUTPUT_DIR, "gene_annotations.txt"),
+        os.path.join(QC_DIR, "multiqc_report.html")
+
+# Create adapters file if it doesn't exist
+rule create_adapters:
+    output:
+        ADAPTERS_FILE
+    shell:
+        """
+        if [ ! -f {output} ]; then
+            echo "Creating adapters.fa file..."
+            mkdir -p $(dirname {output})
+            echo ">Nextera_Adapter_Read1" > {output}
+            echo "CTGTCTCTTATACACATCT" >> {output}
+            echo ">Nextera_Adapter_Read2" >> {output}
+            echo "AGATGTGTATAAGAGACAG" >> {output}
+        else
+            echo "adapters.fa file already exists."
+        fi
+        """
+
+# Download FASTQ data using fastq-dump
+rule download_fastq:
+    input:
+        ADAPTERS_FILE
+    output:
+        forward = os.path.join(DATA_DIR, f"{RUN_ID}_1.fastq.gz"),
+        reverse = os.path.join(DATA_DIR, f"{RUN_ID}_2.fastq.gz")
+    params:
+        run_id = RUN_ID,
+        outdir = DATA_DIR
+    shell:
+        "mkdir -p {params.outdir} && fastq-dump --split-files --gzip --outdir {params.outdir} {params.run_id}"
+
+# Run FastQC on the raw data
+rule fastqc_raw:
+    input:
+        forward = os.path.join(DATA_DIR, f"{RUN_ID}_1.fastq.gz"),
+        reverse = os.path.join(DATA_DIR, f"{RUN_ID}_2.fastq.gz")
+    output:
+        forward_zip = os.path.join(QC_DIR, f"{RUN_ID}_1_fastqc.zip"),
+        reverse_zip = os.path.join(QC_DIR, f"{RUN_ID}_2_fastqc.zip")
+    params:
+        outdir = QC_DIR
+    shell:
+        "mkdir -p {params.outdir} && fastqc {input.forward} {input.reverse} -o {params.outdir}"
+
+# Trim adapters and low-quality bases using Trimmomatic
+rule trimmomatic:
+    input:
+        forward = os.path.join(DATA_DIR, f"{RUN_ID}_1.fastq.gz"),
+        reverse = os.path.join(DATA_DIR, f"{RUN_ID}_2.fastq.gz"),
+        adapters = ADAPTERS_FILE
+    output:
+        forward_paired = os.path.join(TRIMMED_DIR, "trimmed_forward_paired.fastq.gz"),
+        forward_unpaired = os.path.join(TRIMMED_DIR, "trimmed_forward_unpaired.fastq.gz"),
+        reverse_paired = os.path.join(TRIMMED_DIR, "trimmed_reverse_paired.fastq.gz"),
+        reverse_unpaired = os.path.join(TRIMMED_DIR, "trimmed_reverse_unpaired.fastq.gz")
+    params:
+        trim_opts = "ILLUMINACLIP:{input.adapters}:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:36"
+    shell:
+        """
+        mkdir -p {TRIMMED_DIR}
+        trimmomatic PE \
+        {input.forward} {input.reverse} \
+        {output.forward_paired} {output.forward_unpaired} \
+        {output.reverse_paired} {output.reverse_unpaired} \
+        {params.trim_opts}
+        """
+
+# Run FastQC on the trimmed data
+rule fastqc_trimmed:
+    input:
+        forward_paired = os.path.join(TRIMMED_DIR, "trimmed_forward_paired.fastq.gz"),
+        reverse_paired = os.path.join(TRIMMED_DIR, "trimmed_reverse_paired.fastq.gz")
+    output:
+        forward_zip = os.path.join(QC_DIR, "trimmed_forward_paired_fastqc.zip"),
+        reverse_zip = os.path.join(QC_DIR, "trimmed_reverse_paired_fastqc.zip")
+    params:
+        outdir = QC_DIR
+    shell:
+        "fastqc {input.forward_paired} {input.reverse_paired} -o {params.outdir}"
+
+# Combine all QC reports using MultiQC
+rule multiqc:
+    input:
+        raw_forward_zip = os.path.join(QC_DIR, f"{RUN_ID}_1_fastqc.zip"),
+        raw_reverse_zip = os.path.join(QC_DIR, f"{RUN_ID}_2_fastqc.zip"),
+        trimmed_forward_zip = os.path.join(QC_DIR, "trimmed_forward_paired_fastqc.zip"),
+        trimmed_reverse_zip = os.path.join(QC_DIR, "trimmed_reverse_paired_fastqc.zip")
+    output:
+        report = os.path.join(QC_DIR, "multiqc_report.html")
+    params:
+        qc_dir = QC_DIR
+    shell:
+        "multiqc {params.qc_dir} -o {params.qc_dir}"
+
+# Index the reference genome
+rule bwa_index:
+    input:
+        ref = REF_GENOME
+    output:
+        amb = f"{REF_GENOME}.amb",
+        ann = f"{REF_GENOME}.ann",
+        bwt = f"{REF_GENOME}.bwt",
+        pac = f"{REF_GENOME}.pac",
+        sa = f"{REF_GENOME}.sa"
+    shell:
+        "bwa index {input.ref}"
+
+# Align trimmed reads to the reference genome
+rule bwa_mem:
+    input:
+        ref = REF_GENOME,
+        index_files = [f"{REF_GENOME}.{ext}" for ext in ["amb", "ann", "bwt", "pac", "sa"]],
+        forward_paired = os.path.join(TRIMMED_DIR, "trimmed_forward_paired.fastq.gz"),
+        reverse_paired = os.path.join(TRIMMED_DIR, "trimmed_reverse_paired.fastq.gz")
+    output:
+        sam = os.path.join(OUTPUT_DIR, "aligned_reads.sam")
+    shell:
+        "bwa mem {input.ref} {input.forward_paired} {input.reverse_paired} > {output.sam}"
+
+# Convert SAM to BAM
+rule samtools_view:
+    input:
+        sam = os.path.join(OUTPUT_DIR, "aligned_reads.sam")
+    output:
+        bam = os.path.join(OUTPUT_DIR, "aligned_reads.bam")
+    shell:
+        "samtools view -Sb {input.sam} > {output.bam}"
+
+# Sort BAM file
+rule samtools_sort:
+    input:
+        bam = os.path.join(OUTPUT_DIR, "aligned_reads.bam")
+    output:
+        sorted_bam = os.path.join(OUTPUT_DIR, "sorted_reads.bam")
+    shell:
+        "samtools sort {input.bam} -o {output.sorted_bam}"
+
+# Index BAM file
+rule samtools_index:
+    input:
+        sorted_bam = os.path.join(OUTPUT_DIR, "sorted_reads.bam")
+    output:
+        bai = os.path.join(OUTPUT_DIR, "sorted_reads.bam.bai")
+    shell:
+        "samtools index {input.sorted_bam}"
+
+# Call variants with FreeBayes
+rule freebayes:
+    input:
+        ref = REF_GENOME,
+        bam = os.path.join(OUTPUT_DIR, "sorted_reads.bam"),
+        bai = os.path.join(OUTPUT_DIR, "sorted_reads.bam.bai")
+    output:
+        vcf = os.path.join(OUTPUT_DIR, "raw_variants.vcf")
+    shell:
+        "freebayes -f {input.ref} {input.bam} > {output.vcf}"
+
+# Create sequence dictionary for GATK
+rule gatk_create_dict:
+    input:
+        ref = REF_GENOME
+    output:
+        dict = os.path.join(os.path.dirname(REF_GENOME), os.path.splitext(os.path.basename(REF_GENOME))[0] + ".dict")
+    shell:
+        "gatk CreateSequenceDictionary -R {input.ref} -O {output.dict}"
+
+# Filter variants with GATK
+rule gatk_variant_filtration:
+    input:
+        ref = REF_GENOME,
+        dict = os.path.join(os.path.dirname(REF_GENOME), os.path.splitext(os.path.basename(REF_GENOME))[0] + ".dict"),
+        vcf = os.path.join(OUTPUT_DIR, "raw_variants.vcf")
+    output:
+        filtered_vcf = os.path.join(OUTPUT_DIR, "filtered_variants.vcf")
+    params:
+        qd_threshold = QD_THRESHOLD
+    shell:
+        """
+        gatk VariantFiltration \
+        -R {input.ref} \
+        -V {input.vcf} \
+        -O {output.filtered_vcf} \
+        --filter-expression "QD < {params.qd_threshold}" \
+        --filter-name "LowQD"
+        """
+
+# Annotate variants with SnpEff
+rule snpeff:
+    input:
+        vcf = os.path.join(OUTPUT_DIR, "filtered_variants.vcf")
+    output:
+        annotated_vcf = os.path.join(OUTPUT_DIR, "annotated_variants.vcf"),
+        stats = os.path.join(OUTPUT_DIR, "snpEff_summary.html")
+    shell:
+        "snpEff ann NC_045512.2 {input.vcf} > {output.annotated_vcf}"
+
+# Extract annotation information
+rule vcftools:
+    input:
+        vcf = os.path.join(OUTPUT_DIR, "annotated_variants.vcf")
+    output:
+        info = os.path.join(OUTPUT_DIR, "annotations.INFO")
+    params:
+        prefix = os.path.join(OUTPUT_DIR, "annotations")
+    shell:
+        "vcftools --vcf {input.vcf} --get-INFO ANN --out {params.prefix}"
+
+# Format annotations to be more readable
+rule format_annotations:
+    input:
+        info = os.path.join(OUTPUT_DIR, "annotations.INFO")
+    output:
+        txt = os.path.join(OUTPUT_DIR, "gene_annotations.txt")
+    shell:
+        """
+        awk -F '\\t' 'NR>1 {{split($5, ann, ","); for(i in ann) {{split(ann[i], a, "|"); print $1, $2, $3, $4, a[2], a[4], a[10]}}}}' {input.info} > {output.txt}
+        """

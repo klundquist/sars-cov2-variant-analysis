@@ -1,0 +1,23 @@
+name: sars-cov2-analysis
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.9
+  - bwa
+  - samtools
+  - freebayes
+  - gatk4
+  - snpeff
+  - fastqc
+  - trimmomatic
+  - multiqc
+  - sra-tools
+  - vcftools
+  - snakemake-minimal
+  - pip
+  - pip:
+    - pandas
+    - matplotlib
+    - seaborn
